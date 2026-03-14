@@ -1,0 +1,6 @@
+venv/
+*.pt
+snapshots/
+__pycache__/
+*.pyc
+.ultralytics/
