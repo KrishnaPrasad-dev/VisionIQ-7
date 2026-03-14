@@ -9,10 +9,13 @@ class PersonDetector:
         self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
         print(f'Using device: {self.device}')
 
-        self.model = YOLO("yolo11s.pt")      # ← self.model
-        self.model.to(self.device)            # ← self.model
+        self.model = YOLO("yolo11s.pt")
+        self.model.to(self.device)
 
-        # Warmup run
+        # ByteTrack for persistent IDs
+        self.tracker = sv.ByteTrack()
+
+        # Warmup — use float32 for warmup to avoid dtype conflict
         dummy = np.zeros((480, 640, 3), dtype=np.uint8)
         self.model(dummy, classes=[0], conf=0.5, verbose=False)
         print(f'YOLO11s loaded and warmed up on {self.device}!')
@@ -25,11 +28,15 @@ class PersonDetector:
                 frame,
                 classes=[0],
                 conf=0.5,
-                imgsz=640,
-                device=self.device,    # ← force GPU here too
+                imgsz=416,          # reduced from 640 — faster
+                half=self.device == 'cuda',  # FP16 only on GPU
+                device=self.device,
                 verbose=False
             )
-            return sv.Detections.from_ultralytics(results[0])
+            detections = sv.Detections.from_ultralytics(results[0])
+            if len(detections) > 0:
+                detections = self.tracker.update_with_detections(detections)
+            return detections
         except Exception as e:
             print(f'Detection error: {e}')
             return sv.Detections.empty()

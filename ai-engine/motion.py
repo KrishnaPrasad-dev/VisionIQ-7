@@ -3,38 +3,36 @@ import numpy as np
 
 class MotionAnalyzer:
     def __init__(self):
-        # MOG2 for background subtraction (abandoned objects)
         self.bg_subtractor = cv2.createBackgroundSubtractorMOG2(
-            history=500,
+            history=300,
             varThreshold=50,
             detectShadows=False
         )
 
-        # Optical flow state
-        self.prev_gray   = None
-        self.frame_counter = 0
-
-        # Abandoned object tracking
+        self.prev_gray          = None
+        self.frame_counter      = 0
         self.stationary_regions = {}
 
-        # Thresholds - tuned to reduce false positives
-        self.RUNNING_SPEED_THRESHOLD    = 25.0  # pixels/frame
-        self.ABANDONED_FRAMES_THRESHOLD = 150   # ~5 seconds at 30fps
+        # Cache last result — return on skipped frames
+        self._last_result = {
+            'running':      False,
+            'panic':        False,
+            'abandoned':    False,
+            'motion_score': 0,
+            'flow_vectors': []
+        }
+
+        self.RUNNING_SPEED_THRESHOLD    = 25.0
+        self.ABANDONED_FRAMES_THRESHOLD = 150
 
     def analyze(self, frame):
-        """
-        Returns:
-          running       bool  - fast movement detected
-          panic         bool  - chaotic multi-direction movement
-          abandoned     bool  - stationary object detected
-          motion_score  float - 0-100 motion threat level
-          flow_vectors  list  - for visualization
-        """
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        h, w = frame.shape[:2]
-
         self.frame_counter += 1
-        skip_optical_flow = (self.frame_counter % 3 != 0)  # run every 3rd frame
+
+        # Skip every other frame — return cached result instantly
+        if self.frame_counter % 2 == 0:
+            return self._last_result
+
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
 
         running      = False
         panic        = False
@@ -43,10 +41,10 @@ class MotionAnalyzer:
         flow_vectors = []
 
         # ── OPTICAL FLOW (every 3rd frame) ───────────────────
-        if self.prev_gray is not None and not skip_optical_flow:
+        if self.prev_gray is not None and self.frame_counter % 3 == 0:
             points = cv2.goodFeaturesToTrack(
                 self.prev_gray,
-                maxCorners=80,
+                maxCorners=50,
                 qualityLevel=0.3,
                 minDistance=10,
                 blockSize=7
@@ -75,13 +73,10 @@ class MotionAnalyzer:
                         good_curr.reshape(-1, 2).tolist()
                     ))
 
-                    # Running — high average speed
                     if avg_speed > self.RUNNING_SPEED_THRESHOLD:
                         running = True
                         motion_score += min(avg_speed * 1.5, 40)
 
-                    # Panic — chaotic vectors in many directions
-                    # Stricter: needs high speed AND high angle variance
                     if len(vectors) > 10:
                         angles    = np.arctan2(vectors[:, 1], vectors[:, 0])
                         angle_std = float(np.std(angles))
@@ -91,41 +86,40 @@ class MotionAnalyzer:
 
         self.prev_gray = gray
 
-        # ── MOG2 BACKGROUND SUBTRACTION ──────────────────────
-        fg_mask = self.bg_subtractor.apply(frame)
+        # ── MOG2 (every 5th frame only) ───────────────────────
+        if self.frame_counter % 5 == 0:
+            fg_mask = self.bg_subtractor.apply(frame)
+            kernel  = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+            fg_mask = cv2.morphologyEx(fg_mask, cv2.MORPH_OPEN, kernel)
+            fg_mask = cv2.dilate(fg_mask, kernel, iterations=1)
 
-        kernel  = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
-        fg_mask = cv2.morphologyEx(fg_mask, cv2.MORPH_OPEN, kernel)
-        fg_mask = cv2.dilate(fg_mask, kernel, iterations=2)
+            contours, _ = cv2.findContours(
+                fg_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+            )
 
-        contours, _ = cv2.findContours(
-            fg_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
-        )
+            current_regions = set()
+            for cnt in contours:
+                area = cv2.contourArea(cnt)
+                if 2000 < area < 50000:
+                    x, y, rw, rh = cv2.boundingRect(cnt)
+                    region_key   = (x // 20, y // 20)
+                    current_regions.add(region_key)
 
-        current_regions = set()
-        for cnt in contours:
-            area = cv2.contourArea(cnt)
-            if 2000 < area < 50000:
-                x, y, rw, rh = cv2.boundingRect(cnt)
-                region_key   = (x // 20, y // 20)
-                current_regions.add(region_key)
+                    if region_key not in self.stationary_regions:
+                        self.stationary_regions[region_key] = 0
+                    self.stationary_regions[region_key] += 1
 
-                if region_key not in self.stationary_regions:
-                    self.stationary_regions[region_key] = 0
-                self.stationary_regions[region_key] += 1
+                    if self.stationary_regions[region_key] > self.ABANDONED_FRAMES_THRESHOLD:
+                        abandoned     = True
+                        motion_score += 25
 
-                if self.stationary_regions[region_key] > self.ABANDONED_FRAMES_THRESHOLD:
-                    abandoned     = True
-                    motion_score += 25
-
-        # Clean up regions no longer present
-        for key in list(self.stationary_regions.keys()):
-            if key not in current_regions:
-                del self.stationary_regions[key]
+            for key in list(self.stationary_regions.keys()):
+                if key not in current_regions:
+                    del self.stationary_regions[key]
 
         motion_score = min(motion_score, 100)
 
-        return {
+        self._last_result = {
             'running':      running,
             'panic':        panic,
             'abandoned':    abandoned,
@@ -133,5 +127,6 @@ class MotionAnalyzer:
             'flow_vectors': flow_vectors
         }
 
-# Single global instance
+        return self._last_result
+
 motion_analyzer = MotionAnalyzer()

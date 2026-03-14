@@ -1,5 +1,7 @@
 import cv2, base64, time, os, json
+import asyncio
 import numpy as np
+from concurrent.futures import ThreadPoolExecutor
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
@@ -29,9 +31,12 @@ app.add_middleware(
 os.makedirs('snapshots', exist_ok=True)
 app.mount("/snapshots", StaticFiles(directory="snapshots"), name="snapshots")
 
-clients = []
+clients     = []
+ip_stream   = {"active": False, "url": "", "task": None}
+executor    = ThreadPoolExecutor(max_workers=2)
 
 
+# ── FRAME PROCESSOR (runs in thread executor) ─────────────
 def process_one_frame(frame):
     detections   = detector.detect(frame)
     person_count = len(detections)
@@ -39,7 +44,6 @@ def process_one_frame(frame):
 
     motion = motion_analyzer.analyze(frame)
 
-    # ── ZONE CHECKS ──────────────────────────────────────
     zone_results       = []
     any_zone_triggered = False
 
@@ -55,7 +59,7 @@ def process_one_frame(frame):
                 triggered     = bool(in_zone_flags.any())
 
                 if detections.tracker_id is not None and triggered:
-                    loiter_alerts = dwell_tracker.update(
+                    dwell_tracker.update(
                         detections.tracker_id,
                         zone_data['name'],
                         in_zone_flags
@@ -73,7 +77,6 @@ def process_one_frame(frame):
     loitering_ids   = list(dwell_tracker.loitering.keys())
     loitering_count = len(loitering_ids)
 
-    # ── SCORING ──────────────────────────────────────────
     after_hours = is_after_hours()
     raw_score   = calculate_threat_score(
         person_count, zone_results, after_hours, loitering_count, motion
@@ -81,7 +84,6 @@ def process_one_frame(frame):
     score  = apply_score_decay(raw_score)
     status = get_status(score)
 
-    # ── SNAPSHOT + ALERT (with cooldown) ─────────────────
     update_critical_timer(status)
 
     snapshot_path   = None
@@ -99,9 +101,7 @@ def process_one_frame(frame):
             'panic':           motion.get('panic'),
             'abandoned':       motion.get('abandoned'),
         })
-
     elif status == 'SUSPICIOUS' and check_cooldown():
-        # Shared cooldown — SUSPICIOUS also uses last_alert_time
         config.last_alert_time = time.time()
         timestamp              = datetime.now().strftime('%Y%m%d_%H%M%S')
         snapshot_path          = f'snapshots/alert_{timestamp}.jpg'
@@ -109,26 +109,23 @@ def process_one_frame(frame):
             'loitering_count': loitering_count,
         })
 
-    # ── ANNOTATE ─────────────────────────────────────────
     annotated = annotate_frame(
         frame, detections, zone_results, score, status, loitering_ids, motion
     )
 
-    # Save snapshot after annotation so it has bounding boxes
     if snapshot_path:
         cv2.imwrite(snapshot_path, annotated)
         print(f"Snapshot saved: {snapshot_path}")
 
-    _, buffer     = cv2.imencode('.jpg', annotated, [cv2.IMWRITE_JPEG_QUALITY, 80])
+    _, buffer     = cv2.imencode('.jpg', annotated, [cv2.IMWRITE_JPEG_QUALITY, 75])
     annotated_b64 = base64.b64encode(buffer).decode()
 
-    # Build alert list for dashboard (last 20, no SAFE)
     alerts = [
         {
-            'timestamp':    e.get('timestamp', ''),
-            'status':       e.get('status', ''),
-            'score':        e.get('score', 0),
-            'person_count': e.get('person_count', 0),
+            'timestamp':     e.get('timestamp', ''),
+            'status':        e.get('status', ''),
+            'score':         e.get('score', 0),
+            'person_count':  e.get('person_count', 0),
             'snapshot_path': e.get('snapshot_path'),
         }
         for e in config.alert_log
@@ -155,16 +152,123 @@ def process_one_frame(frame):
     }
 
 
-# ── WebSocket ─────────────────────────────────────────────
+# ── BROADCAST ─────────────────────────────────────────────
+async def broadcast(result):
+    dead = []
+    for client in clients:
+        try:
+            await client.send_text(json.dumps(result))
+        except:
+            dead.append(client)
+    for d in dead:
+        clients.remove(d)
+
+
+# ── IP CAM LOOP ───────────────────────────────────────────
+async def ip_cam_loop(url: str):
+    print(f"Starting IP cam stream: {url}")
+    cap = cv2.VideoCapture(url)
+
+    if not cap.isOpened():
+        print(f"ERROR: Cannot open stream: {url}")
+        ip_stream["active"] = False
+        return
+
+    print("IP cam connected!")
+    loop       = asyncio.get_event_loop()
+    fail_count = 0
+
+    while ip_stream["active"]:
+        ret, frame = cap.read()
+
+        if not ret:
+            fail_count += 1
+            if fail_count > 10:
+                print("Too many failures — stopping IP cam")
+                break
+            await asyncio.sleep(0.1)
+            continue
+
+        fail_count = 0
+        frame  = cv2.resize(frame, (640, 480))
+
+        # Run processing in thread so async loop stays free
+        result = await loop.run_in_executor(executor, process_one_frame, frame)
+        await broadcast(result)
+        await asyncio.sleep(0.033)  # ~30 FPS
+
+    cap.release()
+    ip_stream["active"] = False
+    print("IP cam stream stopped")
+
+
+# ── ENDPOINTS ─────────────────────────────────────────────
+class StreamRequest(BaseModel):
+    url: str
+
+@app.post("/start_stream")
+async def start_stream(body: StreamRequest):
+    if ip_stream["active"]:
+        ip_stream["active"] = False
+        await asyncio.sleep(0.3)
+
+    url = body.url.strip()
+    if not url:
+        raise HTTPException(status_code=400, detail="URL required")
+
+    ip_stream["active"] = True
+    ip_stream["url"]    = url
+    ip_stream["task"]   = asyncio.create_task(ip_cam_loop(url))
+    return {"status": "started", "url": url}
+
+
+@app.post("/stop_stream")
+async def stop_stream():
+    ip_stream["active"] = False
+    if ip_stream["task"]:
+        ip_stream["task"].cancel()
+        ip_stream["task"] = None
+    return {"status": "stopped"}
+
+
+@app.get("/stream_status")
+async def stream_status():
+    return {"active": ip_stream["active"], "url": ip_stream["url"]}
+
+
+@app.get('/health')
+def health():
+    return {
+        'status':  'running',
+        'model':   'YOLO11s',
+        'mode':    config.mode,
+        'ip_cam':  ip_stream["active"],
+        'ip_url':  ip_stream["url"],
+        'clients': len(clients),
+    }
+
+
+@app.post('/override_safe')
+def override_safe():
+    config.prev_score = 0.0
+    log_alert(0, 'OVERRIDE', 0)
+    return {'status': 'overridden'}
+
+
+# ── WEBSOCKET ─────────────────────────────────────────────
 @app.websocket("/ws/stream")
 async def websocket_stream(websocket: WebSocket):
     await websocket.accept()
     clients.append(websocket)
     print(f"Client connected — total: {len(clients)}")
+    loop = asyncio.get_event_loop()
 
     try:
         while True:
             b64 = await websocket.receive_text()
+
+            if ip_stream["active"]:
+                continue
 
             try:
                 img_data = base64.b64decode(b64)
@@ -176,17 +280,9 @@ async def websocket_stream(websocket: WebSocket):
                 print(f"Frame decode error: {e}")
                 continue
 
-            result = process_one_frame(frame)
-
-            # Broadcast to all connected clients
-            dead = []
-            for client in clients:
-                try:
-                    await client.send_text(json.dumps(result))
-                except:
-                    dead.append(client)
-            for d in dead:
-                clients.remove(d)
+            # Run in thread executor — keeps async loop free
+            result = await loop.run_in_executor(executor, process_one_frame, frame)
+            await broadcast(result)
 
     except WebSocketDisconnect:
         if websocket in clients:

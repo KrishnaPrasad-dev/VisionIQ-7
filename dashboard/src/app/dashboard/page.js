@@ -12,7 +12,7 @@ export default function DashboardPage(){
 
   const status =
     score >= 75 ? "CRITICAL"
-    : score >= 45 ? "SUSPICIOUS"
+    : score >= 45 ? "SUSPICIOUS"  
     : "SAFE"
 
   const statusColor =
